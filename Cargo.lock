@@ -82,7 +82,6 @@ name = "ch32v003_ili9341_dma"
 version = "0.1.0"
 dependencies = [
  "ch32-hal",
- "embassy-futures",
  "embedded-graphics",
  "embedded-hal 1.0.0",
  "panic-halt",

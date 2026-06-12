@@ -80,30 +80,60 @@ backlight is driven by a PWM signal from **Timer 1, Channel 2**.
 | Remap       | `0` (`SCK = PC5`, `MOSI = PC6`)         |
 | Fixed pins  | `SCK = PC5`, `MOSI = PC6`, `MISO = PC7` |
 
+The SPI peripheral is created **blocking** (used directly for commands and
+per-pixel writes). Bulk fills are handled separately by driving `DMA1_CH3`
+directly (see below).
+
 ```rust
 let mut spi_config = hal::spi::Config::default(); // Mode 0, MSB first
 spi_config.frequency = Hertz::mhz(12);
-// SPI1 TX-only with DMA; remap 0 -> SCK = PC5, MOSI = PC6.
-let spi = Spi::new_txonly::<0>(p.SPI1, p.PC5, p.PC6, p.DMA1_CH3, spi_config);
+// SPI1 TX-only; remap 0 -> SCK = PC5, MOSI = PC6.
+let spi = Spi::new_blocking_txonly::<0>(p.SPI1, p.PC5, p.PC6, spi_config);
 ```
 
-### DMA (mandatory)
+> **System clock:** the devkit runs at **24 MHz HCLK** (default HSI). The SPI
+> baud rate is a divider of HCLK, and the maximum is HCLK/2, so 12 MHz is the
+> fastest usable SPI clock. Requesting a higher value just clamps to HCLK/2.
 
-On this devkit the SPI interface is **always driven through DMA**. Pixel data is
-streamed to the display in memory-to-peripheral (TX) mode, freeing the CPU
-during large transfers.
+### DMA fills (memory-to-peripheral, no increment)
+
+Solid fills (clearing the screen, color bars, rectangles) are the bulk of the
+SPI traffic, so they go out over DMA. The CH32V003's DMA fully supports
+**memory-to-peripheral with no memory increment**, which is ideal here: the DMA
+reads a *single* 16-bit color word from one fixed address and writes it to the
+SPI data register `count` times. No RAM frame buffer is needed and the CPU is
+idle during the transfer.
 
 The DMA channel for `SPI1_TX` is **fixed by hardware to DMA1 Channel 3** on the
-CH32V003 (`SPI1_RX` is Channel 2). It cannot be reassigned to another channel.
+CH32V003 (`SPI1_RX` is Channel 2). It cannot be reassigned.
 
-`Spi::new_txonly` returns an async SPI driver, so DMA writes are `async`. The
-firmware drives them from a plain (blocking) `qingke_rt::entry` with
-`embassy_futures::block_on`, avoiding a full async executor:
+To fill, the driver:
+
+1. Switches SPI to **16-bit frames** (`DFF = 1`) so one DMA word = one pixel.
+   MSB-first framing sends the high byte then low byte, matching RGB565.
+2. Enables `TXDMAEN` and starts a no-increment transfer of the color word.
+3. Waits for completion, then waits for `BSY` to clear and restores 8-bit
+   framing for the next command / text write.
 
 ```rust
-// Stream a buffer of pixels to the panel over DMA.
-block_on(spi.write(&buf)).unwrap();
+// Stream `count` copies of one 16-bit color, no memory increment, no buffer.
+let datar = hal::pac::SPI1.datar().as_ptr() as *mut u16;
+unsafe {
+    Transfer::new_write_repeated::<u16>(
+        dma.reborrow(),           // Peri<DMA1_CH3>
+        Default::default(),       // request
+        &color,                   // single source word (fixed address)
+        count,                    // up to 65535 per transfer
+        datar,
+        TransferOptions::default(),
+    )
+    .blocking_wait();
+}
 ```
+
+> A single DMA transfer is limited to 65535 items, so a full-screen fill
+> (320 × 240 = 76 800 px) is split into two transfers. `blocking_wait()` polls
+> to completion, so no async executor is required.
 
 ---
 
@@ -234,8 +264,9 @@ cargo run --release   # builds + flashes via wlink (WCH-LinkE)
   that package.
 - **Pin availability:** the CH32V003 has a small pin count. Verify each pin in
   the table is broken out on your specific package/board before wiring.
-- **Clock speed:** the firmware runs SPI at 12 MHz. Reduce it if you see display
-  artifacts; you can push higher with short, clean wiring.
+- **Clock speed:** with a 24 MHz HCLK, 12 MHz (HCLK/2) is the maximum SPI clock,
+  which the firmware uses. Reduce it if you see display artifacts on long wiring.
+  To go faster you would need to raise the system clock (HCLK) first.
 - **Flash headroom:** with `embedded-graphics` and the `FONT_10X20` + `FONT_6X10`
   fonts, the release build is ~14 KB of the 16 KB flash. Fonts dominate that —
   drop `FONT_10X20` if you need more room.

@@ -11,24 +11,27 @@
 //!   RST  = PC2
 //!   BLK  = PA1   (backlight, TIM1_CH2 PWM)
 //!
-//! Pixel data is streamed with DMA (SPI1_TX = DMA1_CH3). The HAL's DMA write is
-//! async, so we drive it with `embassy_futures::block_on` from a blocking main.
+//! Bulk fills are streamed with DMA (SPI1_TX = DMA1_CH3) in
+//! memory-to-peripheral, *no-increment* mode: the DMA reads a single 16-bit
+//! color word from one fixed address and writes it to the SPI data register
+//! `count` times. This needs no RAM frame buffer and is the fastest way to
+//! fill the panel.
 
-use embassy_futures::block_on;
 use embedded_graphics::mono_font::ascii::{FONT_10X20, FONT_6X10};
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::text::Text;
 use hal::delay::Delay;
+use hal::dma::{Transfer, TransferOptions};
 use hal::gpio::{Level, Output};
-use hal::mode::Async;
-use hal::peripherals;
+use hal::mode::Blocking;
 use hal::spi::Spi;
 use hal::time::Hertz;
 use hal::timer::low_level::CountingMode;
 use hal::timer::simple_pwm::{PwmPin, SimplePwm};
 use hal::timer::Channel;
+use hal::{peripherals, Peri};
 use {ch32_hal as hal, panic_halt as _};
 
 // Landscape orientation: 320 wide x 240 tall.
@@ -43,13 +46,18 @@ const BLUE: u16 = 0x001F;
 const WHITE: u16 = 0xFFFF;
 
 struct Ili9341 {
-    spi: Spi<'static, peripherals::SPI1, Async>,
+    spi: Spi<'static, peripherals::SPI1, Blocking>,
     dc: Output<'static>,
+    dma: Peri<'static, peripherals::DMA1_CH3>,
 }
 
 impl Ili9341 {
-    fn new(spi: Spi<'static, peripherals::SPI1, Async>, dc: Output<'static>) -> Self {
-        Self { spi, dc }
+    fn new(
+        spi: Spi<'static, peripherals::SPI1, Blocking>,
+        dc: Output<'static>,
+        dma: Peri<'static, peripherals::DMA1_CH3>,
+    ) -> Self {
+        Self { spi, dc, dma }
     }
 
     /// Send a command byte followed by optional argument bytes.
@@ -110,7 +118,7 @@ impl Ili9341 {
         self.cmd(0x2B, &[(y0 >> 8) as u8, y0 as u8, (y1 >> 8) as u8, y1 as u8]);
     }
 
-    /// Fill a rectangle with a solid color. Pixel data goes out over DMA.
+    /// Fill a rectangle with a solid color, streamed by no-increment DMA.
     fn fill_rect(&mut self, x: u16, y: u16, w: u16, h: u16, color: u16) {
         if w == 0 || h == 0 || x >= WIDTH || y >= HEIGHT {
             return;
@@ -123,29 +131,80 @@ impl Ili9341 {
         self.spi.blocking_write(&[0x2Cu8]).unwrap(); // RAMWR
         self.dc.set_high();
 
-        // Small RAM-resident buffer pre-filled with the color, streamed by DMA.
-        const N: usize = 128;
-        let [hi, lo] = color.to_be_bytes();
-        let mut buf = [0u8; N * 2];
-        let mut i = 0;
-        while i < N {
-            buf[2 * i] = hi;
-            buf[2 * i + 1] = lo;
-            i += 1;
+        let count = (x1 - x + 1) as u32 * (y1 - y + 1) as u32;
+        self.dma_fill(color, count);
+    }
+
+    /// Stream `count` copies of a single 16-bit `color` to the panel using
+    /// memory-to-peripheral DMA with no memory increment (no frame buffer).
+    fn dma_fill(&mut self, color: u16, count: u32) {
+        use hal::pac::SPI1;
+
+        // Switch the SPI to 16-bit frames (one pixel per word) and enable TX DMA.
+        SPI1.ctlr1().modify(|w| w.set_spe(false));
+        SPI1.ctlr1().modify(|w| w.set_dff(true));
+        SPI1.ctlr2().modify(|w| w.set_txdmaen(true));
+        SPI1.ctlr1().modify(|w| w.set_spe(true));
+
+        let datar = SPI1.datar().as_ptr() as *mut u16;
+        let mut remaining = count;
+        while remaining > 0 {
+            // A single DMA transfer is limited to 65535 items.
+            let n = remaining.min(0xFFFF) as usize;
+            unsafe {
+                Transfer::new_write_repeated::<u16>(
+                    self.dma.reborrow(),
+                    Default::default(),
+                    &color,
+                    n,
+                    datar,
+                    TransferOptions::default(),
+                )
+                .blocking_wait();
+            }
+            remaining -= n as u32;
         }
 
-        let mut count = (x1 - x + 1) as u32 * (y1 - y + 1) as u32;
-        while count > 0 {
-            let n = core::cmp::min(count, N as u32) as usize;
-            block_on(self.spi.write(&buf[..n * 2])).unwrap();
-            count -= n as u32;
-        }
+        // Wait for the shift register to drain, then restore 8-bit framing so
+        // the next command/pixel write (which is 8-bit) behaves correctly.
+        while SPI1.statr().read().bsy() {}
+        SPI1.ctlr1().modify(|w| w.set_spe(false));
+        SPI1.ctlr2().modify(|w| w.set_txdmaen(false));
+        SPI1.ctlr1().modify(|w| w.set_dff(false));
     }
 
     fn fill_screen(&mut self, color: u16) {
         self.fill_rect(0, 0, WIDTH, HEIGHT, color);
     }
+
+    /// Define the vertical scroll regions (VSCRDEF, 0x33).
+    /// `tfa + vsa + bfa` must equal the panel's 320-line frame memory.
+    fn set_scroll_area(&mut self, tfa: u16, vsa: u16, bfa: u16) {
+        self.cmd(
+            0x33,
+            &[
+                (tfa >> 8) as u8,
+                tfa as u8,
+                (vsa >> 8) as u8,
+                vsa as u8,
+                (bfa >> 8) as u8,
+                bfa as u8,
+            ],
+        );
+    }
+
+    /// Set the scroll start line (VSCRSAR, 0x37), 0..=319.
+    ///
+    /// The ILI9341 scrolls along its native 320-line axis. In landscape
+    /// (`MADCTL` MV set) that axis maps to the horizontal screen direction, so
+    /// changing this slides the content sideways and wraps cyclically.
+    fn set_scroll_start(&mut self, line: u16) {
+        self.cmd(0x37, &[(line >> 8) as u8, line as u8]);
+    }
 }
+
+// The ILI9341 frame memory is 320 lines along its native scroll axis.
+const SCROLL_LEN: u16 = 320;
 
 impl OriginDimensions for Ili9341 {
     fn size(&self) -> Size {
@@ -240,26 +299,33 @@ fn main() -> ! {
     rst.set_high();
     delay.delay_ms(120);
 
-    // SPI1 in TX-only mode with DMA (SPI1_TX = DMA1_CH3). SCK = PC5, MOSI = PC6.
+    // SPI1 TX-only, blocking (commands/pixels). Bulk fills use DMA1_CH3
+    // directly via no-increment transfers. SCK = PC5, MOSI = PC6.
     let mut spi_config = hal::spi::Config::default();
     spi_config.frequency = Hertz::mhz(12);
-    let spi = Spi::new_txonly::<0>(p.SPI1, p.PC5, p.PC6, p.DMA1_CH3, spi_config);
+    let spi = Spi::new_blocking_txonly::<0>(p.SPI1, p.PC5, p.PC6, spi_config);
 
-    let mut display = Ili9341::new(spi, dc);
+    let mut display = Ili9341::new(spi, dc, p.DMA1_CH3);
     hal::println!("display init ...");
     display.init(&mut delay);
     hal::println!("display init ok");
 
-    // Initial scene: color bars (80 px each across 320 px) + transparent text.
-    let mut rotation = 0usize;
+    // Draw the scene once (color bars + transparent text), then enable
+    // full-panel vertical scrolling. We never redraw the bars again; the
+    // ILI9341 slides them in hardware.
     display.fill_screen(BLACK);
-    draw_scene(&mut display, rotation);
+    draw_scene(&mut display, 0);
+    display.set_scroll_area(0, SCROLL_LEN, 0);
 
-    // Sweep the backlight brightness up and down so dimming is visible.
-    // Each time it bottoms out at 0 (screen dark), shift the bars right by one.
+    // `scroll` slides the scene horizontally (hardware), `level` sweeps the
+    // backlight brightness. Both advance every frame.
+    let mut scroll: u16 = 0;
     let mut level: i32 = 0;
     let mut step: i32 = 2;
     loop {
+        scroll = (scroll + 2) % SCROLL_LEN;
+        display.set_scroll_start(scroll);
+
         level += step;
         if level >= 100 {
             level = 100;
@@ -267,11 +333,9 @@ fn main() -> ! {
         } else if level <= 0 {
             level = 0;
             step = 2;
-            // Backlight is off here, so redraw the shifted bars unseen.
-            rotation = (rotation + 1) % BARS.len();
-            draw_scene(&mut display, rotation);
         }
         backlight.set_duty(Channel::Ch2, bl_max * level as u32 / 100);
+
         delay.delay_ms(15);
     }
 }
