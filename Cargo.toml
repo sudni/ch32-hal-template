@@ -1,38 +1,27 @@
 [package]
-name = "{{ project-name }}"
+name = "ch32v003_ili9341_dma"
 version = "0.1.0"
-authors = ["{{ authors }}"]
-edition = "2024"
-license = "MIT OR Apache-2.0"
-
-[[bin]]
-name = "{{ project-name }}"
-harness = false # do not use the built in cargo test harness -> resolve rust-analyzer errors
+edition = "2021"
 
 [dependencies]
-{% if embassy_dep -%}
-ch32-hal = { git = "https://github.com/ch32-rs/ch32-hal.git", features = [
-    "{{ mcu }}",
-    "embassy",
-{%- else -%}
 ch32-hal = { git = "https://github.com/ch32-rs/ch32-hal.git", default-features = false, features = [
-    "{{ mcu }}",
-{%- endif %}
+    "ch32v003f4p6",
     "time-driver-tim2",
     "rt",
     "memory-x",
 ] }
-{% if embassy_dep -%}
-embassy-executor = { version = "0.10.0", features = [
-    "platform-spin",
-    "executor-thread"
-] }
-embassy-time = { version = "0.5.1" }
-{%- endif %}
+
 qingke-rt = "0.7"
 qingke = "0.7"
 embedded-hal = "1.0.0"
 panic-halt = "1.0.0"
+
+# Lets us drive the HAL's async (DMA) SPI from a plain `qingke_rt::entry`
+# without pulling in a full embassy executor.
+embassy-futures = "0.1.1"
+
+# Text/graphics rendering (fonts, shapes) on the display.
+embedded-graphics = "0.8.1"
 
 [profile.dev]
 opt-level = 's'
