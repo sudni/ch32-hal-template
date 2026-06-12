@@ -72,7 +72,7 @@ backlight is driven by a PWM signal from **Timer 1, Channel 2**.
 |-------------|-----------------------------------------|
 | Peripheral  | `SPI1`                                  |
 | Role        | Master                                  |
-| Clock speed | `12 MHz`                                |
+| Clock speed | `24 MHz` (HCLK/2 at 48 MHz)             |
 | Data size   | `8 bits`                                |
 | SPI mode    | Mode 0 (CPOL = 0, CPHA = 0)             |
 | Bit order   | MSB first                               |
@@ -85,15 +85,25 @@ per-pixel writes). Bulk fills are handled separately by driving `DMA1_CH3`
 directly (see below).
 
 ```rust
+// Run the core at 48 MHz (HSI 24 MHz -> PLL x2) so HCLK = 48 MHz.
+let mut config = hal::Config::default();
+config.rcc = hal::rcc::Config::SYSCLK_FREQ_48MHZ_HSI;
+let p = hal::init(config);
+
 let mut spi_config = hal::spi::Config::default(); // Mode 0, MSB first
-spi_config.frequency = Hertz::mhz(12);
+spi_config.frequency = Hertz::mhz(24);            // HCLK/2 = 24 MHz
 // SPI1 TX-only; remap 0 -> SCK = PC5, MOSI = PC6.
 let spi = Spi::new_blocking_txonly::<0>(p.SPI1, p.PC5, p.PC6, spi_config);
 ```
 
-> **System clock:** the devkit runs at **24 MHz HCLK** (default HSI). The SPI
-> baud rate is a divider of HCLK, and the maximum is HCLK/2, so 12 MHz is the
-> fastest usable SPI clock. Requesting a higher value just clamps to HCLK/2.
+> **System clock & SPI speed:** SPI1's baud clock is **HCLK**, and the minimum
+> divider is **/2**, so the fastest SPI clock is HCLK/2. The HAL's *default*
+> config runs HCLK at only **8 MHz** (HSI 24 MHz ÷3), which would cap SPI at
+> 4 MHz. To reach 24 MHz SPI the firmware raises the core to **48 MHz** with the
+> `SYSCLK_FREQ_48MHZ_HSI` preset (HSI 24 MHz → PLL ×2 → HCLK 48 MHz); then
+> `frequency = 24 MHz` selects the /2 divider. Requesting a value above HCLK/2
+> just clamps to HCLK/2. If you see artifacts on long/poor wiring, drop the
+> requested frequency (e.g. 12 MHz → /4) or shorten the leads.
 
 ### DMA fills (memory-to-peripheral, no increment)
 
@@ -213,22 +223,77 @@ If colors look swapped (red ↔ blue), clear the `BGR` bit (`0x08`) in the value
 ### Text & graphics
 
 The driver implements `embedded-graphics` `DrawTarget`, so you can draw text and
-shapes. The firmware draws **transparent** text (glyph pixels only) so it
-overlays the background:
+shapes. The firmware draws text into two fixed bands (see §7), filling a solid
+background first and then the glyphs on top:
 
 ```rust
-let style = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE); // transparent overlay
-Text::new("Hello CH32V003!", Point::new(8, 150), style)
+display.fill_rect(0, 0, WIDTH, TOP_H, BLACK);              // solid band background
+let style = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
+Text::new("Hello CH32V003!", Point::new(8, 32), style)
     .draw(&mut display)
     .unwrap();
 ```
 
-For an **opaque** background per character instead, set
-`style.background_color = Some(Rgb565::BLACK);`.
+For a **transparent** overlay (glyph pixels only, background shows through),
+just skip the `fill_rect`. For an **opaque** background per character, set
+`style.background_color = Some(Rgb565::BLACK);` on the style instead.
 
 ---
 
-## 7. Toolchain & build configuration
+## 7. Demo animation
+
+The reference firmware runs a self-contained demo. The screen is split into
+**three horizontal zones** along the 240 px vertical axis:
+
+| Zone   | Rows (`y`)              | Height | Content                                  |
+|--------|-------------------------|--------|------------------------------------------|
+| Top    | `0 .. TOP_H`            | 50 px  | Fixed text: `"Hello CH32V003!"`          |
+| Middle | `TOP_H .. TOP_H+MID_H`  | 140 px | Scrolling color bars (animated)          |
+| Bottom | `HEIGHT-BOT_H .. HEIGHT`| 50 px  | Fixed text: `"ILI9341 + SPI DMA"` + `"PWM backlight sweep"` |
+
+Two effects run together:
+
+1. **Scrolling color bars** (middle zone only): eight vertical rainbow bars
+   (red, orange, yellow, green, cyan, blue, indigo, violet — 40 px each) slide
+   horizontally and wrap around.
+2. **PWM brightness sweep:** the backlight duty fades 0 → 100 → 0 % in parallel,
+   affecting all three zones equally.
+
+The full animation walkthrough lives in [`animation.md`](./animation.md).
+
+### Fixed zones drawn once, middle band scrolled
+
+The top/bottom text bands are painted **once** by `draw_fixed` before the loop.
+The loop then repaints **only the middle band** each frame, so the text is never
+overwritten and **does not flicker**:
+
+```rust
+draw_fixed(&mut display);            // top + bottom text, drawn once
+let mut offset = 0u16;
+loop {
+    offset = (offset + 4) % WIDTH;   // 4 px/frame
+    draw_bars(&mut display, offset); // repaints MID_Y..MID_Y+MID_H only
+    // ... advance PWM brightness ...
+}
+```
+
+`draw_bars` splits the middle band into a handful of solid runs (one per visible
+bar segment, accounting for wrap-around) and fills each — `seg × MID_H` — with a
+single no-increment DMA transfer, so the redraw is cheap and uses no frame buffer.
+
+### Why not hardware scrolling?
+
+The ILI9341 *does* have a hardware scroll (`VSCRDEF 0x33` / `VSCRSAR 0x37`) with
+its own top/bottom fixed areas (TFA / BFA). But it scrolls along the native
+320-line axis, which in this **landscape** orientation maps to the **horizontal**
+direction — whereas these three zones are stacked **vertically**. The axes don't
+line up, so the firmware uses the confined software repaint above instead. (To
+use hardware scroll with fixed top/bottom text you'd switch the panel to
+portrait, where that axis is vertical.)
+
+---
+
+## 8. Toolchain & build configuration
 
 This project targets the CH32V003 (QingKe RV32EC core) and builds with a custom
 target spec.
@@ -256,7 +321,7 @@ cargo run --release   # builds + flashes via wlink (WCH-LinkE)
 
 ---
 
-## 8. Notes & adjustments
+## 9. Notes & adjustments
 
 - **MCU variant:** the reference build uses `ch32v003f4p6`. If your board uses a
   different package (`ch32v003a4m6`, `ch32v003f4u6`, `ch32v003j4m6`), update the
@@ -264,9 +329,10 @@ cargo run --release   # builds + flashes via wlink (WCH-LinkE)
   that package.
 - **Pin availability:** the CH32V003 has a small pin count. Verify each pin in
   the table is broken out on your specific package/board before wiring.
-- **Clock speed:** with a 24 MHz HCLK, 12 MHz (HCLK/2) is the maximum SPI clock,
-  which the firmware uses. Reduce it if you see display artifacts on long wiring.
-  To go faster you would need to raise the system clock (HCLK) first.
+- **Clock speed:** the firmware raises the core to **48 MHz** (HSI 24 MHz → PLL
+  ×2) via `SYSCLK_FREQ_48MHZ_HSI`, giving HCLK = 48 MHz and a **24 MHz** SPI clock
+  (HCLK/2, the bus maximum). The HAL default would otherwise run HCLK at 8 MHz.
+  Reduce the SPI `frequency` (e.g. 12 MHz → /4) if you see artifacts on long wiring.
 - **Flash headroom:** with `embedded-graphics` and the `FONT_10X20` + `FONT_6X10`
   fonts, the release build is ~14 KB of the 16 KB flash. Fonts dominate that —
   drop `FONT_10X20` if you need more room.

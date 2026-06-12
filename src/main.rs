@@ -16,6 +16,13 @@
 //! color word from one fixed address and writes it to the SPI data register
 //! `count` times. This needs no RAM frame buffer and is the fastest way to
 //! fill the panel.
+//!
+//! The screen is laid out as three horizontal zones (see `doc/animation.md`):
+//! a fixed top text band, a scrolling color-bar band in the middle, and a fixed
+//! bottom text band. In landscape the ILI9341 hardware scroll would move
+//! horizontally (fixed columns left/right), so it can't keep the top/bottom text
+//! fixed; the middle band is therefore scrolled in software, repainting only that
+//! band each frame so the text never moves.
 
 use embedded_graphics::mono_font::ascii::{FONT_10X20, FONT_6X10};
 use embedded_graphics::mono_font::MonoTextStyle;
@@ -40,10 +47,6 @@ const HEIGHT: u16 = 240;
 
 // RGB565 colors.
 const BLACK: u16 = 0x0000;
-const RED: u16 = 0xF800;
-const GREEN: u16 = 0x07E0;
-const BLUE: u16 = 0x001F;
-const WHITE: u16 = 0xFFFF;
 
 struct Ili9341 {
     spi: Spi<'static, peripherals::SPI1, Blocking>,
@@ -177,34 +180,7 @@ impl Ili9341 {
         self.fill_rect(0, 0, WIDTH, HEIGHT, color);
     }
 
-    /// Define the vertical scroll regions (VSCRDEF, 0x33).
-    /// `tfa + vsa + bfa` must equal the panel's 320-line frame memory.
-    fn set_scroll_area(&mut self, tfa: u16, vsa: u16, bfa: u16) {
-        self.cmd(
-            0x33,
-            &[
-                (tfa >> 8) as u8,
-                tfa as u8,
-                (vsa >> 8) as u8,
-                vsa as u8,
-                (bfa >> 8) as u8,
-                bfa as u8,
-            ],
-        );
-    }
-
-    /// Set the scroll start line (VSCRSAR, 0x37), 0..=319.
-    ///
-    /// The ILI9341 scrolls along its native 320-line axis. In landscape
-    /// (`MADCTL` MV set) that axis maps to the horizontal screen direction, so
-    /// changing this slides the content sideways and wraps cyclically.
-    fn set_scroll_start(&mut self, line: u16) {
-        self.cmd(0x37, &[(line >> 8) as u8, line as u8]);
-    }
 }
-
-// The ILI9341 frame memory is 320 lines along its native scroll axis.
-const SCROLL_LEN: u16 = 320;
 
 impl OriginDimensions for Ili9341 {
     fn size(&self) -> Size {
@@ -239,35 +215,79 @@ impl DrawTarget for Ili9341 {
     }
 }
 
-// Color bar palette, drawn left-to-right and rotated on each cycle.
-const BARS: [u16; 4] = [RED, GREEN, BLUE, WHITE];
+// Screen is split into three horizontal zones along the 240 px (vertical) axis:
+//   [0 .. TOP_H)                 top fixed text area
+//   [TOP_H .. TOP_H + MID_H)     scrolling color-bar area
+//   [HEIGHT - BOT_H .. HEIGHT)   bottom fixed text area
+const TOP_H: u16 = 50;
+const BOT_H: u16 = 50;
+const MID_Y: u16 = TOP_H;
+const MID_H: u16 = HEIGHT - TOP_H - BOT_H;
+
+// Rainbow palette in RGB565. 8 bands tile the 320 px width exactly (40 px each),
+// so the scrolling pattern wraps seamlessly.
+const BARS: [u16; 8] = [
+    0xF800, // red
+    0xFD00, // orange
+    0xFFE0, // yellow
+    0x07E0, // green
+    0x07FF, // cyan
+    0x001F, // blue
+    0x4810, // indigo
+    0xF81F, // violet
+];
 const BAR_W: u16 = WIDTH / BARS.len() as u16;
 
-/// Draw the rotated color bars plus the transparent text overlay.
-fn draw_scene(display: &mut Ili9341, rotation: usize) {
-    for (i, _) in BARS.iter().enumerate() {
-        let color = BARS[(i + rotation) % BARS.len()];
-        display.fill_rect(i as u16 * BAR_W, 0, BAR_W, HEIGHT, color);
+/// Repaint the middle (scrolling) zone with the bar pattern shifted right by
+/// `offset` px, wrapping around. Only the middle band is touched, so the fixed
+/// top/bottom text is never overwritten. Each run is one no-increment DMA fill.
+fn draw_bars(display: &mut Ili9341, offset: u16) {
+    let mut x = 0u16;
+    while x < WIDTH {
+        let pos = (x + offset) % WIDTH;
+        let band = (pos / BAR_W) as usize % BARS.len();
+        // Length until the next bar boundary, clipped to the screen edge.
+        let seg = (BAR_W - pos % BAR_W).min(WIDTH - x);
+        display.fill_rect(x, MID_Y, seg, MID_H, BARS[band]);
+        x += seg;
     }
+}
+
+/// Draw the two fixed text zones once. The top and bottom bands are filled with
+/// a solid background, then text is drawn on top. The scrolling loop never
+/// touches these bands, so the text stays put and does not flicker.
+fn draw_fixed(display: &mut Ili9341) {
+    display.fill_rect(0, 0, WIDTH, TOP_H, BLACK);
+    display.fill_rect(0, HEIGHT - BOT_H, WIDTH, BOT_H, BLACK);
 
     let title = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
-    Text::new("Hello CH32V003!", Point::new(8, 150), title)
+    Text::new("Hello CH32V003!", Point::new(8, 32), title)
         .draw(display)
         .unwrap();
 
     let subtitle = MonoTextStyle::new(&FONT_6X10, Rgb565::YELLOW);
-    Text::new("ILI9341 + SPI DMA", Point::new(8, 175), subtitle)
+    Text::new("ILI9341 + SPI DMA", Point::new(8, HEIGHT as i32 - 30), subtitle)
         .draw(display)
         .unwrap();
-    Text::new("PWM backlight sweep", Point::new(8, 195), subtitle)
-        .draw(display)
-        .unwrap();
+    Text::new(
+        "PWM backlight sweep",
+        Point::new(8, HEIGHT as i32 - 14),
+        subtitle,
+    )
+    .draw(display)
+    .unwrap();
 }
 
 #[qingke_rt::entry]
 fn main() -> ! {
     hal::debug::SDIPrint::enable();
-    let p = hal::init(hal::Config::default());
+
+    // Run the core at 48 MHz (HSI 24 MHz -> PLL x2) so HCLK = 48 MHz. SPI1's
+    // baud clock is HCLK with a minimum /2 divider, so this is what allows a
+    // 24 MHz SPI clock (HCLK/2). The default config runs HCLK at only 8 MHz.
+    let mut config = hal::Config::default();
+    config.rcc = hal::rcc::Config::SYSCLK_FREQ_48MHZ_HSI;
+    let p = hal::init(config);
     let mut delay = Delay;
 
     // Control lines.
@@ -302,7 +322,7 @@ fn main() -> ! {
     // SPI1 TX-only, blocking (commands/pixels). Bulk fills use DMA1_CH3
     // directly via no-increment transfers. SCK = PC5, MOSI = PC6.
     let mut spi_config = hal::spi::Config::default();
-    spi_config.frequency = Hertz::mhz(12);
+    spi_config.frequency = Hertz::mhz(24); // HCLK/2 = 48/2 = 24 MHz (max for this bus)
     let spi = Spi::new_blocking_txonly::<0>(p.SPI1, p.PC5, p.PC6, spi_config);
 
     let mut display = Ili9341::new(spi, dc, p.DMA1_CH3);
@@ -310,21 +330,20 @@ fn main() -> ! {
     display.init(&mut delay);
     hal::println!("display init ok");
 
-    // Draw the scene once (color bars + transparent text), then enable
-    // full-panel vertical scrolling. We never redraw the bars again; the
-    // ILI9341 slides them in hardware.
     display.fill_screen(BLACK);
-    draw_scene(&mut display, 0);
-    display.set_scroll_area(0, SCROLL_LEN, 0);
 
-    // `scroll` slides the scene horizontally (hardware), `level` sweeps the
-    // backlight brightness. Both advance every frame.
-    let mut scroll: u16 = 0;
+    // Draw the fixed top/bottom text zones once; the loop never repaints them.
+    draw_fixed(&mut display);
+
+    // Each frame: repaint only the middle band with the bars shifted by `offset`
+    // (software scroll). The fixed text stays put and does not flicker. `level`
+    // sweeps the backlight brightness.
+    let mut offset: u16 = 0;
     let mut level: i32 = 0;
     let mut step: i32 = 2;
     loop {
-        scroll = (scroll + 2) % SCROLL_LEN;
-        display.set_scroll_start(scroll);
+        offset = (offset + 4) % WIDTH;
+        draw_bars(&mut display, offset);
 
         level += step;
         if level >= 100 {
@@ -335,7 +354,5 @@ fn main() -> ! {
             step = 2;
         }
         backlight.set_duty(Channel::Ch2, bl_max * level as u32 / 100);
-
-        delay.delay_ms(15);
     }
 }
